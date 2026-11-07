@@ -1,3 +1,4 @@
+
 import * as cdk from 'aws-cdk-lib/core';
 import * as apig from 'aws-cdk-lib/aws-apigateway';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
@@ -25,7 +26,11 @@ export class AppApiStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    const appFn = (name: string, entry: string, environment: Record<string, string> = {}) =>
+    const appFn = (
+      name: string,
+      entry: string,
+      environment: Record<string, string> = {}
+    ) =>
       new node.NodejsFunction(this, name, {
         architecture: lambda.Architecture.ARM_64,
         runtime: lambda.Runtime.NODEJS_22_X,
@@ -40,48 +45,92 @@ export class AppApiStack extends cdk.Stack {
       });
 
     // Lambdas
-    const getMovieRolesFn = appFn('GetMovieRolesFn', 'app/get-movie-roles.ts');
+    const getMovieRolesFn = appFn(
+      'GetMovieRolesFn',
+      'app/get-movie-roles.ts'
+    );
     const getActorFn = appFn('GetActorFn', 'app/get-actor.ts');
-    const addMovieRoleFn = appFn('AddMovieRoleFn', 'app/add-movie-role.ts');
-    const authorizerFn = appFn('AuthorizerFn', 'auth/authorizer.ts', {
-      USER_POOL_ID: props.userPool.userPoolId,
-      CLIENT_ID: props.userPoolClient.userPoolClientId,
-    });
+    const addMovieRoleFn = appFn(
+      'AddMovieRoleFn',
+      'app/add-movie-role.ts'
+    );
+    const authorizerFn = appFn(
+      'AuthorizerFn',
+      'auth/authorizer.ts',
+      {
+        USER_POOL_ID: props.userPool.userPoolId,
+        CLIENT_ID: props.userPoolClient.userPoolClientId,
+      }
+    );
 
+    // DynamoDB permissions
     table.grantReadData(getMovieRolesFn);
     table.grantReadData(getActorFn);
+    table.grantReadWriteData(addMovieRoleFn);
 
     // Sample data, written once when the stack is created.
     const items = seedItems();
-    if (items.length > 25) throw new Error('BatchWriteItem accepts at most 25 items');
-    const seeder = new cr.AwsCustomResource(this, 'SeedMovieCastData', {
-      onCreate: {
-        service: 'DynamoDB',
-        action: 'BatchWriteItem',
-        parameters: {
-          RequestItems: {
-            [table.tableName]: items.map((item) => ({ PutRequest: { Item: marshall(item) } })),
+    if (items.length > 25) {
+      throw new Error('BatchWriteItem accepts at most 25 items');
+    }
+
+    const seeder = new cr.AwsCustomResource(
+      this,
+      'SeedMovieCastData',
+      {
+        onCreate: {
+          service: 'DynamoDB',
+          action: 'BatchWriteItem',
+          parameters: {
+            RequestItems: {
+              [table.tableName]: items.map((item) => ({
+                PutRequest: { Item: marshall(item) },
+              })),
+            },
           },
+          physicalResourceId:
+            cr.PhysicalResourceId.of('MovieCastSeedData'),
         },
-        physicalResourceId: cr.PhysicalResourceId.of('MovieCastSeedData'),
-      },
-      policy: cr.AwsCustomResourcePolicy.fromSdkCalls({ resources: [table.tableArn] }),
-      installLatestAwsSdk: false,
-    });
+        policy: cr.AwsCustomResourcePolicy.fromSdkCalls({
+          resources: [table.tableArn],
+        }),
+        installLatestAwsSdk: false,
+      }
+    );
 
-    const userAuthorizer = new apig.RequestAuthorizer(this, 'UserAuthorizer', {
-      handler: authorizerFn,
-      identitySources: [apig.IdentitySource.header('cookie')],
-      resultsCacheTtl: cdk.Duration.minutes(0),
-    });
+    // Cognito authorizer
+    const userAuthorizer = new apig.RequestAuthorizer(
+      this,
+      'UserAuthorizer',
+      {
+        handler: authorizerFn,
+        identitySources: [
+          apig.IdentitySource.header('cookie'),
+        ],
+        resultsCacheTtl: cdk.Duration.minutes(0),
+      }
+    );
 
+    // API Gateway
     const api = new apig.RestApi(this, 'AppApi', {
       description: 'Movie cast API',
       endpointTypes: [apig.EndpointType.REGIONAL],
       deployOptions: { stageName: 'dev' },
       defaultCorsPreflightOptions: {
-        allowHeaders: ['Content-Type', 'X-Amz-Date', 'Authorization', 'X-Api-Key'],
-        allowMethods: ['OPTIONS', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+        allowHeaders: [
+          'Content-Type',
+          'X-Amz-Date',
+          'Authorization',
+          'X-Api-Key',
+        ],
+        allowMethods: [
+          'OPTIONS',
+          'GET',
+          'POST',
+          'PUT',
+          'PATCH',
+          'DELETE',
+        ],
         allowCredentials: true,
         allowOrigins: ['*'],
       },
@@ -91,19 +140,55 @@ export class AppApiStack extends cdk.Stack {
       authorizer: userAuthorizer,
       authorizationType: apig.AuthorizationType.CUSTOM,
     };
+
+    // API key for administrator POST requests
+    const adminApiKey = api.addApiKey('AdminApiKey', {
+      apiKeyName: 'MovieCastAdminKey',
+    });
+
+    const usagePlan = api.addUsagePlan('AdminUsagePlan', {
+      name: 'MovieCastAdminUsagePlan',
+      throttle: {
+        rateLimit: 10,
+        burstLimit: 20,
+      },
+    });
+
+    usagePlan.addApiKey(adminApiKey);
+    usagePlan.addApiStage({
+      stage: api.deploymentStage,
+    });
+
     // Routes
     const moviesResource = api.root.addResource('movies');
 
-    const movieRolesResource = moviesResource.addResource('{movieID}').addResource('roles');
+    const movieRolesResource = moviesResource
+      .addResource('{movieID}')
+      .addResource('roles');
+
     movieRolesResource.addMethod(
       'GET',
       new apig.LambdaIntegration(getMovieRolesFn),
       userAuth
     );
 
+    const addRolesResource = moviesResource.addResource('roles');
+
+    addRolesResource.addMethod(
+      'POST',
+      new apig.LambdaIntegration(addMovieRoleFn),
+      {
+        apiKeyRequired: true,
+      }
+    );
+
     api.root
       .addResource('actors')
       .addResource('{actorID}')
-      .addMethod('GET', new apig.LambdaIntegration(getActorFn), userAuth);
+      .addMethod(
+        'GET',
+        new apig.LambdaIntegration(getActorFn),
+        userAuth
+      );
   }
 }
